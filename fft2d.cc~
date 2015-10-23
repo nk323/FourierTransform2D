@@ -1,0 +1,356 @@
+// Distributed two-dimensional Discrete FFT transform
+// // NEHA KADAM
+// // ECE 6122 Project 1
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <signal.h>
+#include <math.h>
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "Complex.h"
+#include "InputImage.h"
+
+using namespace std;
+
+void Transform1D(Complex* h, int w, Complex* H);
+void InvTransform1D(Complex* H, int N, Complex* h);
+void Collect(Complex *inBuf, Complex* outBuf, int nCPUs, int myRank, int N);
+void Distribute(Complex *inBuf, Complex* outBuf, int nCPUs, int myRank, int N);
+void Transpose(Complex* data, int N);
+
+
+void Transpose(Complex* data, int N)
+{
+        for(int row = 0; row < N; ++row)
+        {
+                for(int col = 0; col < N; ++col)
+                {
+                        if(row < col)
+                        {
+                                Complex temp = data[N * row + col];
+                                data[N * row + col] = data[N * col + row];
+                                data[N * col + row] = temp;
+                        }
+                }
+        }
+}
+
+void Transform2D(const char* inputFN)
+{ // Do the 2D transform here.
+  // 1) Use the InputImage object to read in the Tower.txt file and
+  //    find the width/height of the input image.
+  // 2) Use MPI to find how many CPUs in total, and which one
+  //    this process is
+  // 3) Allocate an array of Complex object of sufficient size to
+  //    hold the 2d DFT results (size is width * height)
+  // 4) Obtain a pointer to the Complex 1d array of input data
+  // 5) Do the individual 1D transforms on the rows assigned to your CPU
+  // 6) Send the resultant transformed values to the appropriate
+  //    other processors for the next phase.
+  // 6a) To send and receive columns, you might need a separate
+  //     Complex array of the correct size.
+  // 7) Receive messages from other processes to collect your columns
+  // 8) When all columns received, do the 1D transforms on the columns
+  // 9) Send final answers to CPU 0 (unless you are CPU 0)
+  //   9a) If you are CPU 0, collect all values from other processors
+  //       and print out with SaveImageData().
+  InputImage image(inputFN);  // Create the helper object for reading the image
+  // Step (1) in the comments is the line above.
+  // Your code here, steps 2-9
+
+  // Get image width and height
+  int img_w = image.GetWidth();
+  int img_h = image.GetHeight();
+
+  int nCPUs = 0;
+  int rank = 0;
+
+  // Find total number of CPUs and current CPU's rank
+  MPI_Comm_size(MPI_COMM_WORLD, &nCPUs);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  //Create array H to hold 2D DFT results
+  //Complex* H = new Complex[img_w * img_h];
+
+  //Calculate startRow for each CPU
+  int rowsPerCPU = img_h / nCPUs;
+  int startRow = rowsPerCPU * rank;
+
+  //cout << "Total CPUs = " << nCPUs << " and my rank = " << rank << endl;
+
+  //Get pointer to image data
+  Complex* h = image.GetImageData();
+
+  //Get N which is either img_w ot img_h (for a square image)
+  int N = img_w;
+
+  Complex* H = new Complex[N * N];
+  Complex* current_h = h + startRow * N;
+  Complex* current_H = H + (N * startRow);
+  //Each CPU will perform 1D DFT on rows
+  for (int i = 0; i < rowsPerCPU; i++)
+  {
+        Transform1D(current_h, N, current_H);
+        //Jump to next row
+        current_h += N;
+        current_H += N;
+  }
+  
+  //Now CPU 0 collects data from all and transposes the matrix
+  Collect(H, H, nCPUs, rank, N);
+
+  if(rank == 0)
+  {
+  	image.SaveImageData("MyAfter1d.txt", H, img_w, img_h);
+        Transpose(H, N);
+  }
+
+  // Now CPU 0 sends Transposed matrix to all other CPUs 
+  // CPU  sends entire transposed matrix to everyone
+  Distribute(H, H, nCPUs, rank, N);
+
+  // All CPUs will have received the transposed matrix at this point
+  // Now each will perform 1D transform on the transposed matrix 
+  
+  Complex* current_col_h = H + startRow*N;
+  Complex* current_col_H = h + N * startRow;
+  
+  for(int i = 0; i < rowsPerCPU; ++i)
+  {
+        Transform1D(current_col_h, N, current_col_H);
+        //Ensure that after 1 row is completed, you jump to the next row
+        current_col_h = current_col_h + N;
+        current_col_H = current_col_H + N;
+  }
+
+ 
+
+  //Now CPU 0 collects tranformed columns and then transoses them to get final 2D FFT
+  
+  Collect(h, h, nCPUs, rank, N);
+  
+  if (rank == 0)
+  {
+	Transpose(h, N);
+  	image.SaveImageData("MyAfter2d.txt",h , N, N);
+  	//cout << "All Done! Now calculating Inverse DFT !" << endl;
+  }
+////////////////////////////////////////////////////////////////////////////////////////
+
+  // First CPU 0 will need to send the 2D FFT to all other CPUs
+  Distribute(h, h, nCPUs, rank, N);
+
+  // Now each CPU will perform Inv 1D transform on all rows
+  
+  Complex* inv_H = h + N * startRow;
+  Complex* inv_h = H + startRow * N;
+
+  for(int i = 0; i < rowsPerCPU; ++i)
+  {
+        InvTransform1D(inv_H, N, inv_h);
+        //Ensure that after 1 row is completed, you jump to the next row
+        inv_h += N;
+        inv_H += N;
+  }
+  
+  //Now CPU 0 will collect data from all others and transpose it
+  Collect(H, H, nCPUs, rank, N);
+
+  if (rank == 0)
+  {
+	Transpose(H, N);
+  }
+   
+  //Now CPU 0 will send the transposed matrix to all
+
+  Distribute(H, H, nCPUs, rank, N);
+
+  //Now everyone will perform 1-d Inv DFT 
+
+
+  Complex* inv_col_h = h + startRow * N;
+  Complex* inv_col_H = H + N * startRow;
+
+  for(int i = 0; i < rowsPerCPU; ++i)
+  {
+        InvTransform1D(inv_col_H, N, inv_col_h);
+        //Ensure that after 1 row is completed, you jump to the next row
+        inv_col_h += N;
+        inv_col_H += N;
+  }
+
+  //Now CPU 0 collects all the transformed columns and then transposes it
+
+  Collect(h, h, nCPUs, rank, N);
+  if(rank == 0)
+  {
+	Transpose(h, N);
+	image.SaveImageData("MyAfterInverse.txt", h, N, N);
+  }
+
+}
+
+void Distribute(Complex *inBuf, Complex* outBuf, int nCPUs, int myRank, int N)
+{
+  int rc = 0;
+  MPI_Status status;
+  
+  // if CPU 0 then send data to all 
+  if (myRank == 0)
+  {
+        for(int cpu = 1; cpu < nCPUs; ++cpu)
+        {                //int offset = cpu * rowsPerCPU;
+                //cout<<"sending "<<cpu<<endl;
+                 rc = MPI_Send(inBuf, // initial address of recv buffer
+                          N * N * sizeof(Complex), //number of elements
+                          MPI_CHAR, //datatype
+                          cpu,
+                          0,
+                          MPI_COMM_WORLD);
+
+                if (rc != MPI_SUCCESS)
+                {
+                        cout << "Rank " << myRank << "send failed. rc " << rc << endl;
+                        MPI_Finalize();
+                        exit(1);
+                }
+		//cout<<"sent "<<cpu<<endl;
+        }
+  }
+  //if not CPU 0 then receive data from CPU 0
+  if(myRank != 0) 
+  {
+        rc = MPI_Recv(outBuf,
+                      N * N * sizeof(Complex), //number of elements
+                      MPI_CHAR, //datatype
+                      0,
+                      0,
+                      MPI_COMM_WORLD,
+                      &status);
+
+                if (rc != MPI_SUCCESS)
+                {
+                        cout << "Rank " << myRank << "recv failed. rc " << rc << endl;
+                        MPI_Finalize();
+                        exit(1);
+                }
+  }
+}
+
+void Collect(Complex *inBuf, Complex* outBuf, int nCPUs, int myRank, int N)
+{
+  int rc = 0;
+  int rowsPerCPU = N / nCPUs;
+  MPI_Status status;
+  
+  //Everyone sends to CPU 0 including 0  
+        rc = MPI_Send(outBuf + rowsPerCPU * N * myRank,
+                      N * rowsPerCPU * sizeof(Complex), //number of elements
+                      MPI_CHAR, //datatype
+                      0,
+                      0,
+                      MPI_COMM_WORLD);
+
+                if (rc != MPI_SUCCESS)
+                {
+                        cout << "Rank " << myRank << "send failed. rc " << rc << endl;
+                        MPI_Finalize();
+                        exit(1);
+                }
+  
+  //CPU 0 then receives data from iself and all others
+  if (myRank == 0)
+  {
+        for(int cpu = 0; cpu < nCPUs; ++cpu)
+        {
+                int startingRow = cpu * rowsPerCPU * N;
+               // cout<<" recving "<<cpu<<endl;
+                rc = MPI_Recv(inBuf + startingRow, // initial address of recv buffer
+                          N * rowsPerCPU * sizeof(Complex), //number of elements
+                          MPI_CHAR, //datatype
+                          cpu,
+                          0,
+                          MPI_COMM_WORLD,
+                          &status);
+
+                if (rc != MPI_SUCCESS)
+                {
+                        cout << "Rank " << myRank << "recv failed. rc " << rc << endl;
+                        MPI_Finalize();
+                        exit(1);
+                }
+        }
+  }
+  
+}
+
+
+void Transform1D(Complex* h, int N, Complex* H)
+{
+  // Implement a simple 1-d DFT using the double summation equation
+  // given in the assignment handout.  h is the time-domain input
+  // data, w is the width (N), and H is the output array.
+
+  //int N = w;
+
+  for(int n = 0; n < N ; ++n)
+  {
+        H[n] = Complex(0.0,0.0);
+        for(int k = 0; k < N; ++k)
+        {
+                H[n] = H[n] + Complex( cos(2.0 * M_PI * n * k / N),
+                                      -sin(2.0 * M_PI * n * k / N)) * h[k];
+        }
+
+       // if(fabs(H[n].real) < 1e-10) H[n].real = 0;
+       // if(fabs(H[n].imag) < 1e-10) H[n].imag = 0;
+  }
+
+}
+
+void InvTransform1D(Complex* H, int N, Complex* h)
+{
+  for(int n = 0; n < N; ++n)
+  {
+	h[n] = Complex(0.0,0.0);
+	for(int k = 0; k < N; ++k)
+	{
+                h[n] = h[n] + Complex( cos(2.0 * M_PI * n * k / N),
+                                       sin(2.0 * M_PI * n * k / N)) * H[k];
+		
+	}	
+	h[n].real = h[n].real / N;
+	h[n].imag = h[n].imag / N;
+  }
+}
+
+
+int main(int argc, char** argv)
+{
+  string fn("Tower.txt"); // default file name
+  if (argc > 1) fn = string(argv[1]);  // if name specified on cmd line
+  // MPI initialization here
+  int rc;
+  rc = MPI_Init(&argc, &argv);
+  if(rc != MPI_SUCCESS)
+  {
+        printf("Error starting MPI program. Terminating. \n");
+        MPI_Finalize();
+        exit(1);
+  }
+
+
+  Transform2D(fn.c_str()); // Perform the transform.
+  // Finalize MPI here
+  MPI_Finalize();
+  exit(1);
+}
+
+
+
